@@ -1,0 +1,9 @@
+[package]
+name = "veth"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+netavark = "1.15.2"
+netlink-packet-route = "0.22.0"
+ipnet = "2.11.0"
