@@ -71,7 +71,6 @@ impl Plugin for Exec {
                 
             }
         }
-        eprintln!("{:?}", link);
         let mut cont_link = nl.netlink.get_link(netlink::LinkID::ID(link.header.index - 1));
         let mut ip_segments: [u16;8] = [0; 8];
         match subnet.subnet.addr() {
@@ -85,17 +84,33 @@ impl Plugin for Exec {
         let _ = netns.netlink.set_up(netlink::LinkID::ID(cont_link_idx));
         let _ = netns.netlink.add_addr(cont_link_idx, &cont_addr);
         cont_link = netns.netlink.get_link(netlink::LinkID::ID(link.header.index-1));
-        let mut cont_link_local: Ipv6Addr;
+        let mut cont_link_local: Option<Ipv6Addr> = None;
         for addr in netns.netlink.dump_addresses()?{
-            if matches!(addr.header.family,AddressFamily::Inet6) && matches!(addr.header.scope, AddressScope::Link) {
-                for attr in addr.attributes {
-                    if matches!(attr, AddressAttribute::Local(_)) {
-                        cont_link_local = IpAddr::V6(AddressAttribute::Local(attr));
+            match (addr.header.family, addr.header.scope) {
+                (AddressFamily::Inet6, AddressScope::Link) => {
+                    for attr in addr.attributes {
+                        match attr {
+                            AddressAttribute::Address(IpAddr::V6(ip)) => {
+                                cont_link_local = Some(ip);
+                                break
+                            },
+                            _ => {},
+                        }
                     }
-                }
+                    break;
+                },
+                (_,_) => {},
             }
         }
 
+        eprintln!("{:?}", cont_link_local);
+        let default_route = netlink::Route::Ipv6{
+            dest: "::/0".parse()?,
+            gw: cont_link_local.unwrap(),
+            metric: None,
+        };
+        eprintln!("{}", default_route);
+        let _ = netns.netlink.add_route(&default_route);
 
 
         let response = types::StatusBlock {
