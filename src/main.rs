@@ -1,129 +1,136 @@
-use netavark::{
-    network::{
-        core_utils::{open_netlink_sockets, CoreUtils},
-        netlink, types,
-    },
-    new_error,
-    plugin::{Info, Plugin, PluginExec, API_VERSION},
-};
 
 use std::net::{IpAddr, Ipv6Addr};
-use ipnet::IpNet;
-use netlink_packet_route::link::{InfoKind, LinkAttribute::Address, LinkAttribute::Link};
+use std::env;
+use std::io;
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use serde_json;
+use netlink_packet_route::link::{InfoKind, LinkAttribute::Address, LinkAttribute, LinkMessage, LinkInfo, LinkLayerType};
 use netlink_packet_route::address::{AddressScope, AddressAttribute};
-use netlink_packet_route::{AddressFamily};
+use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+use netlink_packet_core::{NetlinkPayload, NetlinkHeader, NetlinkMessage, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK, NLM_F_MATCH};
+use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
+
+const INFO: &str = "{\"version\": \"0.1.0\", \"api_version\": \"1.0.0\"}";
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CreateConfig{
+    name: String,
+    id: String,
+    driver: String,
+    subnets: Vec<HashMap<String, String>>,
+    options: Option<HashMap<String, String>>
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PortMapping {
+    container_port: u16,
+    host_ip: String,
+    host_port: u16,
+    protocol: String,
+    range: u16
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct NetworkOptions {
+    aliases: Vec<String>,
+    interface_name: String,
+    static_ips: Vec<String>,
+    static_mac: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SetupConfig{
+    container_id: String,
+    container_name: String,
+    port_mappings: Vec<PortMapping>,
+    network: CreateConfig,
+    network_options: NetworkOptions,
+
+}
+
+struct NetlinkResponse {
+    resp: NetlinkMessage<RouteNetlinkMessage>,
+    seq: u32,
+}
 
 fn main() {
-    let info = Info::new("0.1.0".to_owned(), API_VERSION.to_owned(), None);
-
-    PluginExec::new(Exec{}, info).exec();
+    match env::args().nth(1){
+        Some(arg) if arg == "info".to_string() => println!("{}",INFO),
+        Some(arg) if arg == "setup".to_string() => setup(),
+        Some(arg) if arg == "teardown".to_string() => teardown(),
+        Some(arg) if arg == "create".to_string() => create(),
+        _ => eprintln!("Invalid argument passed!")
+    }
 }
 
-fn generate_eui64_addr(mac: &Vec<u8>) -> Vec<u16>{
-    let mut host_addr: Vec<u16> = vec![];
-    host_addr.push(u16::from(mac[0]) << 8 | u16::from(mac[1]));
-    host_addr.push(u16::from(mac[2]) << 8 | 0x00ff);
-    host_addr.push(u16::from(mac[3]) | 0xfe00);
-    host_addr.push(u16::from(mac[4]) << 8 | u16::from(mac[5]));
-    return host_addr;
+fn open_netlink() -> Socket {
+    let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let addr = &SocketAddr::new(0,0);
+    socket.bind(addr).unwrap();
+    socket.connect(addr).unwrap();
+
+    return socket
 }
 
-struct Exec{}
+fn create() {
+   let mut raw_json = "".to_string();
+   for line in io::stdin().lines() {
+       raw_json += &line.unwrap();
+   }
+   let config: CreateConfig = serde_json::from_str(raw_json.as_str()).unwrap();
+   if config.subnets.len() != 1 {
+       eprintln!("gaped");
+   }
+   println!("{}", serde_json::to_string(&config).unwrap());
 
-impl Plugin for Exec {
+}
 
-    fn create(&self, network: types::Network) -> Result<types::Network, Box<dyn std::error::Error>>{
-        if network.subnets.clone().unwrap().len() != 1 {
-            return Err(new_error!("This requires one and only one subnet!"))
-        }
-        Ok(network)
-
-    }
-
-    fn setup(&self, netns: String, opts: types::NetworkPluginExec) -> Result<types::StatusBlock, Box<dyn std::error::Error>> {
-        let (mut nl, mut netns) = open_netlink_sockets(&netns)?;
-        let short_id = &opts.container_id[0..12];
-        let link_name = format!("pod{}", short_id);
-        let subnet = &opts.network.subnets.unwrap()[0];
-        let create_link_options = netlink::CreateLinkOptions::new(link_name.clone(), InfoKind::Veth);
-        nl.netlink.create_link(create_link_options)?;
-        let mut link = nl.netlink.get_link(netlink::LinkID::Name(link_name.clone()))?;
-        let mut cont_link_idx: u32 = 0;
-        let mut cont_link_local: Vec<u16> = vec![];
-        let mut host_link_local: Vec<u16> = vec![];
-        for item in &link.attributes {
-            match item {
-                Link(idx) => {
-                    cont_link_idx = *idx;
-                    let cont_link = nl.netlink.get_link(netlink::LinkID::ID(cont_link_idx))?;
-                    for attr in cont_link.attributes {
-                        match attr {
-                            Address(mac) => {
-                                cont_link_local = generate_eui64_addr(&mac);
-                            },
-                            _ => {},
-                        }
-                    }
-                },
-                Address(mac) => host_link_local = generate_eui64_addr(&mac),
-
-                _ => {},
-                
+fn send_netlink_msg(msg: RouteNetlinkMessage, nl: &Socket ,buffer: &mut [u8; 8192], flags: u16, seq: u32) -> NetlinkResponse {
+    let mut packet = NetlinkMessage::new(NetlinkHeader::default(), NetlinkPayload::from(msg));
+    packet.header.sequence_number = seq;
+    packet.header.flags = NLM_F_REQUEST | flags;
+    packet.finalize();
+    packet.serialize(&mut buffer[..]);
+    nl.send(&buffer[..packet.buffer_len()], 0).unwrap();
+    nl.recv(&mut &mut buffer[..], 0);
+    let resp: NetlinkMessage<RouteNetlinkMessage> = NetlinkMessage::deserialize(&buffer[0..]).unwrap();
+    match resp.payload {
+        NetlinkPayload::Error(ref msg) if msg.code != None => {
+            if let Some(code) = msg.code {
+                eprintln!("{:?}", code);
             }
-        }
-        let mut cont_link = nl.netlink.get_link(netlink::LinkID::ID(link.header.index - 1));
-        let mut ip_segments: [u16;8] = [0; 8];
-        match subnet.subnet.addr() {
-            IpAddr::V6(addr) => ip_segments = addr.segments(),
-            _ => {},
-        }
-        let cont_addr = IpNet::new(IpAddr::V6(Ipv6Addr::new(ip_segments[0], ip_segments[1], ip_segments[2], ip_segments[3], ip_segments[4], cont_link_local[1], cont_link_local[2], cont_link_local[3])),subnet.subnet.prefix_len())?;
-        link = nl.netlink.get_link(netlink::LinkID::Name(link_name.clone()))?;
-        let _ = nl.netlink.set_link_ns(cont_link_idx, netns.file);
-        let _ = nl.netlink.set_up(netlink::LinkID::ID(link.header.index));
-        let _ = netns.netlink.set_up(netlink::LinkID::ID(cont_link_idx));
-        let _ = netns.netlink.add_addr(cont_link_idx, &cont_addr);
-        cont_link = netns.netlink.get_link(netlink::LinkID::ID(link.header.index-1));
-        let mut cont_link_local: Option<Ipv6Addr> = None;
-        for addr in netns.netlink.dump_addresses()?{
-            match (addr.header.family, addr.header.scope) {
-                (AddressFamily::Inet6, AddressScope::Link) => {
-                    for attr in addr.attributes {
-                        match attr {
-                            AddressAttribute::Address(IpAddr::V6(ip)) => {
-                                cont_link_local = Some(ip);
-                                break
-                            },
-                            _ => {},
-                        }
-                    }
-                    break;
-                },
-                (_,_) => {},
-            }
-        }
-
-        eprintln!("{:?}", cont_link_local);
-        let default_route = netlink::Route::Ipv6{
-            dest: "::/0".parse()?,
-            gw: cont_link_local.unwrap(),
-            metric: None,
-        };
-        eprintln!("{}", default_route);
-        let _ = netns.netlink.add_route(&default_route);
-
-
-        let response = types::StatusBlock {
-            dns_server_ips: None,
-            dns_search_domains: None,
-            interfaces: None,
-        };
-        Ok(response)
-
+        },
+        _ => {},
     }
+    return NetlinkResponse{resp: resp, seq: seq + 1};
+}
 
-    fn teardown(&self, netns: String, opts: types::NetworkPluginExec) -> Result<(), Box<dyn std::error::Error>> {
-        Ok(())
-    }
+fn setup() {
+   let mut raw_json = "".to_string();
+   for line in io::stdin().lines() {
+       raw_json += &line.unwrap();
+   }
+   eprintln!("{:?}", env::args().nth(2).unwrap());
 
+   let config: SetupConfig = serde_json::from_str(raw_json.as_str()).unwrap();
+   eprintln!("{:?}", config);
+   let mut nl = open_netlink();
+   let mut veth = LinkMessage::default();
+   let mut buffer: [u8; 8192] = [0; 8192];
+   let mut seq: u32 = 0;
+   let interface_name = "pod".to_owned() + &config.container_id[0..12];
+   veth.attributes =  vec![LinkAttribute::IfName(interface_name.to_string()), LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Veth)])];
+   let mut resp = send_netlink_msg(RouteNetlinkMessage::NewLink(veth.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) ,seq);
+
+   resp = send_netlink_msg(RouteNetlinkMessage::GetLink(veth.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_MATCH), resp.seq);
+   println!("{:?}", resp.resp);
+
+   
+
+
+}
+
+fn teardown() {
+    todo!();
 }
