@@ -1,14 +1,20 @@
-
 use std::net::{IpAddr, Ipv6Addr};
 use std::env;
 use std::io;
+use std::time;
+use std::thread;
+use std::os::fd::{AsRawFd, AsFd};
+use std::fs::File;
+use std::process::Command;
+use nix::sched;
 use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use netlink_packet_route::link::{InfoKind, LinkAttribute::Address, LinkAttribute, LinkMessage, LinkInfo, LinkLayerType};
-use netlink_packet_route::address::{AddressScope, AddressAttribute};
+use netlink_packet_route::link::{InfoKind, LinkAttribute::Address, LinkAttribute, LinkMessage, LinkInfo, LinkLayerType, LinkFlags};
+use netlink_packet_route::nsid::{NsidMessage, NsidAttribute};
+use netlink_packet_route::address::{AddressScope, AddressAttribute, AddressMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
-use netlink_packet_core::{NetlinkPayload, NetlinkHeader, NetlinkMessage, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK, NLM_F_MATCH};
+use netlink_packet_core::{NetlinkPayload, NetlinkHeader, NetlinkMessage, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK, NLM_F_MATCH, NLM_F_DUMP};
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
 const INFO: &str = "{\"version\": \"0.1.0\", \"api_version\": \"1.0.0\"}";
@@ -35,16 +41,16 @@ struct PortMapping {
 struct NetworkOptions {
     aliases: Vec<String>,
     interface_name: String,
-    static_ips: Vec<String>,
-    static_mac: String,
+    static_ips: Option<Vec<String>>,
+    static_mac: Option<String>,
+    options: Option<HashMap<String,String>>
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct SetupConfig{
     container_id: String,
     container_name: String,
-    port_mappings: Vec<PortMapping>,
-    network: CreateConfig,
+    port_mappings: Option<Vec<PortMapping>>,
     network_options: NetworkOptions,
 
 }
@@ -64,13 +70,23 @@ fn main() {
     }
 }
 
-fn open_netlink() -> Socket {
-    let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
-    let addr = &SocketAddr::new(0,0);
-    socket.bind(addr).unwrap();
-    socket.connect(addr).unwrap();
+fn open_netlink(netns: &File) -> (Socket, Socket) {
+    let mut self_file = File::open("/proc/self/ns/net").unwrap();
+    let mut host_socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let host_addr = &SocketAddr::new(0,0);
+    host_socket.bind(host_addr).unwrap();
+    host_socket.connect(host_addr).unwrap();
 
-    return socket
+    sched::setns(netns.as_fd(), sched::CloneFlags::CLONE_NEWNET);
+
+    let mut cont_socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let cont_addr = &SocketAddr::new(0,0);
+    cont_socket.bind(cont_addr);
+    cont_socket.connect(cont_addr).unwrap();
+
+    sched::setns(self_file.as_fd(), sched::CloneFlags::CLONE_NEWNET);
+
+    return (host_socket, cont_socket)
 }
 
 fn create() {
@@ -111,11 +127,14 @@ fn setup() {
    for line in io::stdin().lines() {
        raw_json += &line.unwrap();
    }
-   eprintln!("{:?}", env::args().nth(2).unwrap());
-
+   let ns_path = env::args().nth(2).unwrap();
+   eprintln!("{:?}", ns_path);
+   eprintln!("{:?}", raw_json);
    let config: SetupConfig = serde_json::from_str(raw_json.as_str()).unwrap();
    eprintln!("{:?}", config);
-   let mut nl = open_netlink();
+   let mut ns_file = File::open(ns_path).unwrap();
+
+   let (mut nl, mut cont_nl) = open_netlink(&ns_file);
    let mut veth = LinkMessage::default();
    let mut buffer: [u8; 8192] = [0; 8192];
    let mut seq: u32 = 0;
@@ -123,8 +142,47 @@ fn setup() {
    veth.attributes =  vec![LinkAttribute::IfName(interface_name.to_string()), LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Veth)])];
    let mut resp = send_netlink_msg(RouteNetlinkMessage::NewLink(veth.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE) ,seq);
 
-   resp = send_netlink_msg(RouteNetlinkMessage::GetLink(veth.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_MATCH), resp.seq);
-   println!("{:?}", resp.resp);
+
+   let parent_idx: u32;
+   let child_idx: u32;
+
+   let resp = send_netlink_msg(RouteNetlinkMessage::GetLink(veth.clone()), &nl, &mut buffer, (NLM_F_REQUEST), resp.seq);
+   match resp.resp.payload {
+       NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(m)) => {
+           parent_idx = m.header.index;
+           child_idx = m.header.index - 1;
+
+       },
+       _ => panic!("shouldn't be here"),
+   }
+
+   veth.header.flags = LinkFlags::Up;
+   let resp = send_netlink_msg(RouteNetlinkMessage::SetLink(veth.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE), resp.seq);
+
+   let mut child_interface = LinkMessage::default();
+   child_interface.header.index = child_idx;
+   child_interface.attributes = vec![LinkAttribute::NetNsFd(ns_file.as_raw_fd().try_into().unwrap())];
+   let resp = send_netlink_msg(RouteNetlinkMessage::SetLink(child_interface.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE), resp.seq);
+
+   let mut nsid_msg = NsidMessage::default();
+   nsid_msg.attributes = vec![NsidAttribute::Fd(ns_file.as_raw_fd().try_into().unwrap())];
+
+   child_interface.attributes = vec![];
+   child_interface.header.flags = LinkFlags::Up;
+   let resp = send_netlink_msg(RouteNetlinkMessage::SetLink(child_interface.clone()), &cont_nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE), resp.seq);
+
+   thread::sleep(time::Duration::from_secs(2));
+   let mut addr_msg = AddressMessage::default();
+   addr_msg.header.index = parent_idx;
+   addr_msg.header.scope = AddressScope::Link;
+   addr_msg.header.family = AddressFamily::Inet6;
+   eprintln!("{:?}", addr_msg);
+   let resp = send_netlink_msg(RouteNetlinkMessage::GetAddress(addr_msg.clone()), &nl, &mut buffer, (NLM_F_REQUEST | NLM_F_DUMP), resp.seq);
+   eprintln!("{:?}", resp.resp);
+
+
+
+
 
    
 
