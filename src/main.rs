@@ -15,6 +15,7 @@ use netlink_packet_route::nsid::{NsidMessage, NsidAttribute};
 use netlink_packet_route::address::{AddressScope, AddressAttribute, AddressMessage};
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
 use netlink_packet_core::{NetlinkPayload, NetlinkHeader, NetlinkMessage, NLM_F_CREATE, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK, NLM_F_MATCH, NLM_F_DUMP};
+use netlink_packet_core::constants::{NLM_F_MULTIPART};
 use netlink_sys::{protocols::NETLINK_ROUTE, Socket, SocketAddr};
 
 const INFO: &str = "{\"version\": \"0.1.0\", \"api_version\": \"1.0.0\"}";
@@ -56,7 +57,7 @@ struct SetupConfig{
 }
 
 struct NetlinkResponse {
-    resp: NetlinkMessage<RouteNetlinkMessage>,
+    resp: Vec<NetlinkMessage<RouteNetlinkMessage>>,
     seq: u32,
 }
 
@@ -106,20 +107,35 @@ fn send_netlink_msg(msg: RouteNetlinkMessage, nl: &Socket ,buffer: &mut [u8; 819
     let mut packet = NetlinkMessage::new(NetlinkHeader::default(), NetlinkPayload::from(msg));
     packet.header.sequence_number = seq;
     packet.header.flags = NLM_F_REQUEST | flags;
+    let mut responses: Vec<NetlinkMessage<RouteNetlinkMessage>> = vec![];
     packet.finalize();
     packet.serialize(&mut buffer[..]);
     nl.send(&buffer[..packet.buffer_len()], 0).unwrap();
     nl.recv(&mut &mut buffer[..], 0);
-    let resp: NetlinkMessage<RouteNetlinkMessage> = NetlinkMessage::deserialize(&buffer[0..]).unwrap();
-    match resp.payload {
-        NetlinkPayload::Error(ref msg) if msg.code != None => {
-            if let Some(code) = msg.code {
-                eprintln!("{:?}", code);
+    let mut buffer_size = 0;
+    loop {
+        let resp: NetlinkMessage<RouteNetlinkMessage> = NetlinkMessage::deserialize(&buffer[buffer_size..]).unwrap();
+        match (resp.clone().header.flags,resp.clone().payload) {
+            (_,NetlinkPayload::Error(ref msg)) if msg.code != None => {
+                if let Some(code) = msg.code {
+                    eprintln!("{:?}", code);
+                }
+                break;
+            },
+
+            (NLM_F_MULTIPART, NetlinkPayload::Done(_)) => break,
+            (NLM_F_MULTIPART, _) => {
+                responses.push(resp.clone());
+                buffer_size += resp.header.length as usize;
+            },
+
+            _ => {
+                responses.push(resp.clone());
+                break;
             }
-        },
-        _ => {},
+        }
     }
-    return NetlinkResponse{resp: resp, seq: seq + 1};
+    return NetlinkResponse{resp: responses, seq: seq + 1};
 }
 
 fn setup() {
@@ -147,7 +163,7 @@ fn setup() {
    let child_idx: u32;
 
    let resp = send_netlink_msg(RouteNetlinkMessage::GetLink(veth.clone()), &nl, &mut buffer, (NLM_F_REQUEST), resp.seq);
-   match resp.resp.payload {
+   match &resp.resp[0].payload {
        NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewLink(m)) => {
            parent_idx = m.header.index;
            child_idx = m.header.index - 1;
@@ -177,7 +193,7 @@ fn setup() {
    addr_msg.header.scope = AddressScope::Link;
    addr_msg.header.family = AddressFamily::Inet6;
    eprintln!("{:?}", addr_msg);
-   let resp = send_netlink_msg(RouteNetlinkMessage::GetAddress(addr_msg.clone()), &nl, &mut buffer, (NLM_F_REQUEST | NLM_F_DUMP), resp.seq);
+   let resp = send_netlink_msg(RouteNetlinkMessage::GetAddress(addr_msg.clone()), &nl, &mut buffer, NLM_F_DUMP, resp.seq);
    eprintln!("{:?}", resp.resp);
 
 
