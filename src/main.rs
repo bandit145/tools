@@ -104,7 +104,18 @@ fn create() {
     }
     let config: CreateConfig = serde_json::from_str(raw_json.as_str()).unwrap();
     if config.subnets.len() != 1 {
-        eprintln!("gaped");
+        println!("{}", json!({"error": "Only one subnet supported"}));
+        std::process::exit(2);
+    }
+    if !config.subnets[0]
+        .get("subnet")
+        .unwrap()
+        .clone()
+        .unwrap()
+        .contains(":")
+    {
+        println!("{}", json!({"error": "The subnet must be an IPv6 subnet"}));
+        std::process::exit(2);
     }
     println!("{}", serde_json::to_string(&config).unwrap());
 }
@@ -131,7 +142,10 @@ fn send_netlink_msg(
         match (resp.clone().header.flags, resp.clone().payload) {
             (_, NetlinkPayload::Error(ref msg)) if msg.code != None => {
                 if let Some(code) = msg.code {
-                    println!("{}", json!({"error": format!("Netlink error, code: {}", code)}));
+                    println!(
+                        "{}",
+                        json!({"error": format!("Netlink error, code: {}", code)})
+                    );
                     std::process::exit(2);
                 }
                 break;
@@ -206,7 +220,7 @@ fn setup() {
         .parse()
         .unwrap();
     let mut cont_service = "".to_string();
-    for (k, v) in std::env::vars(){
+    for (k, v) in std::env::vars() {
         if k == "PODMAN_ANYCAST_SERVICE".to_string() {
             cont_service = v;
             break;
@@ -224,6 +238,7 @@ fn setup() {
     let mut veth = LinkMessage::default();
     let mut buffer: [u8; 8192] = [0; 8192];
     let mut seq: u32 = 0;
+    let interface_name = "pod".to_owned() + &config.container_id[0..12];
     let mut out = Command::new("nft")
         .arg("list")
         .arg("tables")
@@ -231,21 +246,25 @@ fn setup() {
         .unwrap();
     if !str::from_utf8(&out.stdout)
         .unwrap()
-        .contains("table ip6 podman")
+        .contains(format!("table ip6 {}", &interface_name).as_str())
     {
         out = Command::new("nft")
             .arg("add")
             .arg("table")
             .arg("ip6")
-            .arg("podman")
+            .arg(&interface_name)
             .output()
             .unwrap();
-        out = Command::new("nft")
-            .arg("add chain ip6 nat { type nat hook prerouting priority 0 }")
-            .output()
-            .unwrap();
+        let args = vec![
+            "add",
+            "chain",
+            "ip6",
+            &interface_name,
+            "anycast-dnat",
+            "{ type nat hook prerouting priority -100; }",
+        ];
+        out = Command::new("nft").args(args).output().unwrap();
     }
-    let interface_name = "pod".to_owned() + &config.container_id[0..12];
     veth.attributes = vec![
         LinkAttribute::IfName(interface_name.to_string()),
         LinkAttribute::LinkInfo(vec![LinkInfo::Kind(InfoKind::Veth)]),
@@ -321,7 +340,13 @@ fn setup() {
     new_addr.header.prefix_len = 128;
     new_addr.header.index = child_idx;
     new_addr.attributes = vec![AddressAttribute::Address(IpAddr::V6(container_ip))];
-    let resp = send_netlink_msg(RouteNetlinkMessage::NewAddress(new_addr.clone()), &cont_nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE), resp.seq);
+    let resp = send_netlink_msg(
+        RouteNetlinkMessage::NewAddress(new_addr.clone()),
+        &cont_nl,
+        &mut buffer,
+        (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE),
+        resp.seq,
+    );
 
     thread::sleep(time::Duration::from_secs(2));
 
@@ -362,7 +387,7 @@ fn setup() {
             svc_rt.header.kind = RouteType::Unicast;
             svc_rt.header.destination_prefix_length = 128;
             svc_rt.attributes = vec![
-                RouteAttribute::Gateway(RouteAddress::Inet6(link_local.unwrap())),
+                RouteAttribute::Gateway(RouteAddress::Inet6(gw_linklocal.unwrap())),
                 RouteAttribute::Destination(RouteAddress::Inet6(*ip)),
                 RouteAttribute::Oif(parent_idx),
             ];
@@ -375,41 +400,78 @@ fn setup() {
                 resp.seq,
             );
 
-            svc_rt.attributes = vec![
-                RouteAttribute::Gateway(RouteAddress::Inet6(link_local.unwrap())),
-                RouteAttribute::Destination(RouteAddress::Inet6(container_ip)),
-                RouteAttribute::Oif(parent_idx),
+            let cont_ip_str = container_ip.to_string();
+            let svc_ip_str = ip.to_string();
+            let idx_str = child_idx.to_string();
+            let nf_nat_rule = vec![
+                "add",
+                "rule",
+                "ip6",
+                &interface_name,
+                "anycast-dnat",
+                "ip6",
+                "daddr",
+                svc_ip_str.as_str(),
+                "dnat",
+                "ip6",
+                "to",
+                cont_ip_str.as_str(),
             ];
-
-            let resp = send_netlink_msg(
-                RouteNetlinkMessage::NewRoute(svc_rt.clone()),
-                &nl,
-                &mut buffer,
-                (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE),
-                resp.seq,
-            );
-
-            let nf_nat_rule = format!(
-                "add rule podman nat meta iif {} ip6 daddr {} dnat to {}",
-                child_idx, ip, container_ip
-            );
-        },
-        _ => {},
+            let output = Command::new("nft").args(nf_nat_rule).output().unwrap();
+        }
+        _ => {}
     }
 
     let mut cont_rt = RouteMessage::default();
     cont_rt.header.address_family = AddressFamily::Inet6;
     cont_rt.header.kind = RouteType::Unicast;
     cont_rt.header.destination_prefix_length = 128;
-    cont_rt.attributes = vec![RouteAttribute::Gateway(RouteAddress::Inet6(gw_linklocal.unwrap())),
-    RouteAttribute::Destination(RouteAddress::Inet6(container_ip)),
-    RouteAttribute::Oif(parent_idx),
+    cont_rt.attributes = vec![
+        RouteAttribute::Gateway(RouteAddress::Inet6(gw_linklocal.unwrap())),
+        RouteAttribute::Destination(RouteAddress::Inet6(container_ip)),
+        RouteAttribute::Oif(parent_idx),
     ];
-    let resp = send_netlink_msg(RouteNetlinkMessage::NewRoute(cont_rt.clone()), &nl, &mut buffer, (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE), resp.seq);
+    let resp = send_netlink_msg(
+        RouteNetlinkMessage::NewRoute(cont_rt.clone()),
+        &nl,
+        &mut buffer,
+        (NLM_F_ACK | NLM_F_EXCL | NLM_F_CREATE),
+        resp.seq,
+    );
     println!("{}", serde_json::to_string(&config).unwrap());
-
 }
 
 fn teardown() {
-    todo!();
+    let mut raw_json = "".to_string();
+    for line in io::stdin().lines() {
+        raw_json += &line.unwrap();
+    }
+    let ns_path = env::args().nth(2).unwrap();
+    let mut anycast_addresses: HashMap<String, Ipv6Addr> = HashMap::new();
+    let config: SetupConfig = serde_json::from_str(raw_json.as_str()).unwrap();
+    let interface_name = "pod".to_owned() + &config.container_id[0..12];
+    let out = Command::new("nft")
+        .arg("delete")
+        .arg("table")
+        .arg("ip6")
+        .arg(interface_name)
+        .output();
+    match out {
+        Ok(output) => {
+            if !output.status.success() {
+                println!(
+                    "{}",
+                    json!({"error": str::from_utf8(&output.stdout).unwrap()})
+                );
+                std::process::exit(2);
+            }
+        }
+        _ => {
+            println!(
+                "{}",
+                json!({"error": "something is wrong with your nft executable"})
+            );
+            std::process::exit(2);
+        }
+    }
 }
